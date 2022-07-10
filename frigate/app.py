@@ -17,7 +17,7 @@ from pydantic import ValidationError
 
 from frigate.config import DetectorTypeEnum, FrigateConfig
 from frigate.const import CACHE_DIR, CLIPS_DIR, RECORD_DIR
-from frigate.edgetpu import EdgeTPUProcess
+from frigate.edgetpu import EdgeTPUProcess, EdgeTPUConnection
 from frigate.events import EventCleanup, EventProcessor
 from frigate.http import create_app
 from frigate.log import log_process, root_configurer
@@ -195,6 +195,16 @@ class FrigateApp:
                 )
             if detector.type == DetectorTypeEnum.edgetpu:
                 self.detectors[name] = EdgeTPUProcess(
+                    name,
+                    self.detection_queue,
+                    self.detection_out_events,
+                    model_path,
+                    model_shape,
+                    detector.device,
+                    detector.num_threads,
+                )
+            if detector.type == DetectorTypeEnum.ip:
+                self.detectors[name] = EdgeTPUConnection(
                     name,
                     self.detection_queue,
                     self.detection_out_events,

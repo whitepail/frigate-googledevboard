@@ -36,6 +36,7 @@ class FrigateBaseModel(BaseModel):
 class DetectorTypeEnum(str, Enum):
     edgetpu = "edgetpu"
     cpu = "cpu"
+    ip = "ip"
 
 
 class DetectorConfig(FrigateBaseModel):
@@ -43,6 +44,9 @@ class DetectorConfig(FrigateBaseModel):
     device: str = Field(default="usb", title="Device Type")
     num_threads: int = Field(default=3, title="Number of detection threads")
 
+class ServeConfig(FrigateBaseModel):
+    detector : DetectorConfig = Field(default=None, title="Detector")
+    port: int = Field(default=5001, title="Port to listen on")
 
 class MqttConfig(FrigateBaseModel):
     host: str = Field(title="MQTT Host")
@@ -701,7 +705,6 @@ class LoggerConfig(FrigateBaseModel):
         default_factory=dict, title="Log level for specified processes."
     )
 
-
 class FrigateConfig(FrigateBaseModel):
     mqtt: MqttConfig = Field(title="MQTT Configuration.")
     database: DatabaseConfig = Field(
@@ -715,6 +718,10 @@ class FrigateConfig(FrigateBaseModel):
     )
     detectors: Dict[str, DetectorConfig] = Field(
         default={name: DetectorConfig(**d) for name, d in DEFAULT_DETECTORS.items()},
+        title="Detector hardware configuration.",
+    )
+    serve: ServeConfig = Field(
+        default_factory=ServeConfig,
         title="Detector hardware configuration.",
     )
     logger: LoggerConfig = Field(
@@ -902,3 +909,12 @@ class FrigateConfig(FrigateBaseModel):
             config = json.loads(raw_config)
 
         return cls.parse_obj(config)
+
+class ServerConfig(FrigateConfig):
+    mqtt: BaseModel = Field(default_factory=BaseModel, title="MQTT Configuration.")
+    cameras: Dict[str, CameraConfig] = Field(default_factory=dict, title="Camera configuration.")
+    serve: ServeConfig = Field(title="Detector hardware configuration.")
+
+    @property
+    def runtime_config(self) -> ServerConfig:
+        return self.copy(deep=True)
