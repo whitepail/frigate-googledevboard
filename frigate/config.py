@@ -46,12 +46,16 @@ class DetectorTypeEnum(str, Enum):
     edgetpu = "edgetpu"
     cpu = "cpu"
     tensorrt = "tensorrt"
-
+    ip = "ip"
 
 class DetectorConfig(FrigateBaseModel):
     type: DetectorTypeEnum = Field(default=DetectorTypeEnum.cpu, title="Detector Type")
     device: str = Field(default="usb", title="Device Type")
     num_threads: int = Field(default=3, title="Number of detection threads")
+
+class ServeConfig(FrigateBaseModel):
+    detector : DetectorConfig = Field(default=None, title="Detector")
+    port: int = Field(default=5001, title="Port to listen on")
 
 class UIConfig(FrigateBaseModel):
     use_experimental: bool = Field(default=False, title="Experimental UI")
@@ -886,6 +890,10 @@ class FrigateConfig(FrigateBaseModel):
     logger: LoggerConfig = Field(
         default_factory=LoggerConfig, title="Logging configuration."
     )
+    serve: ServeConfig = Field(
+        default_factory=ServeConfig,
+        title="Detector hardware configuration.",
+    )
     record: RecordConfig = Field(
         default_factory=RecordConfig, title="Global record configuration."
     )
@@ -1089,3 +1097,12 @@ class FrigateConfig(FrigateBaseModel):
             config = json.loads(raw_config)
 
         return cls.parse_obj(config)
+
+class ServerConfig(FrigateConfig):
+    mqtt: BaseModel = Field(default_factory=BaseModel, title="MQTT Configuration.")
+    cameras: Dict[str, CameraConfig] = Field(default_factory=dict, title="Camera configuration.")
+    serve: ServeConfig = Field(title="Detector hardware configuration.")
+
+    @property
+    def runtime_config(self) -> ServerConfig:
+        return self.copy(deep=True)

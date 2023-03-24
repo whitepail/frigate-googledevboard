@@ -679,7 +679,7 @@ class SharedMemoryFrameManager(FrameManager):
         self.shm_store[name] = shm
         return shm.buf
 
-    def get(self, name, shape):
+    def get(self, name, shape) -> np.ndarray:
         if name in self.shm_store:
             shm = self.shm_store[name]
         else:
