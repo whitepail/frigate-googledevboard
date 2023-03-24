@@ -99,6 +99,8 @@ class RecordingMaintainer(threading.Thread):
                     os.path.getctime(cache_path)
                 )
                 start_time = datetime.datetime.fromtimestamp(creation_time)
+                if ( self.config.cameras[camera].record.events.max_seconds > 0
+                ): start_time = start_time - datetime.timedelta(seconds=self.config.cameras[camera].record.events.max_seconds)
             else:
                 start_time = datetime.datetime.strptime(date, "%Y%m%d%H%M%S")
 
@@ -108,7 +110,7 @@ class RecordingMaintainer(threading.Thread):
                     "start_time": start_time,
                 }
             )
-#            logger.warning(f"Adding to cache {camera} {cache_path} {start_time}")
+#            logger.warning(f"Adding to cache {camera} {cache_path} {start_time} {self.config.cameras[camera].record.events.max_seconds}")
 
         # delete all cached files past the most recent 5
         keep_count = 5
@@ -118,6 +120,7 @@ class RecordingMaintainer(threading.Thread):
                 for f in to_remove:
                     Path(f["cache_path"]).unlink(missing_ok=True)
                     self.end_time_cache.pop(f["cache_path"], None)
+#                    logger.warning(f"Remooving {cache_path} due to keep count {keep_count}")
                 grouped_recordings[camera] = grouped_recordings[camera][-keep_count:]
 
         for camera, recordings in grouped_recordings.items():
@@ -175,8 +178,8 @@ class RecordingMaintainer(threading.Thread):
                         duration = float(p.stdout.decode().strip())
                         end_time = start_time + datetime.timedelta(seconds=duration)
                         self.end_time_cache[cache_path] = (end_time, duration)
+#                        logger.warning(f"ffprobe for {cache_path} start_time: {start_time} end_time: {end_time}, duration: {duration}")
                     else:
-                        logger.warning(f"Discarding a corrupt recording segment: {f}")
                         Path(cache_path).unlink(missing_ok=True)
                         continue
 
@@ -198,6 +201,7 @@ class RecordingMaintainer(threading.Thread):
                             overlaps = False
                             Path(cache_path).unlink(missing_ok=True)
                             self.end_time_cache.pop(cache_path, None)
+#                            logger.warning(f"Found event at {event.start_time} and video at {end_time.timestamp}")
                             break
 
                         # if the event is in progress or ends after the recording starts, keep it
@@ -206,6 +210,7 @@ class RecordingMaintainer(threading.Thread):
                             event.end_time is None
                             or event.end_time >= start_time.timestamp()
                         ):
+#                            logger.warning(f"Found event at {event.start_time} and video at {end_time.timestamp}")
                             overlaps = True
                             break
 
@@ -222,6 +227,7 @@ class RecordingMaintainer(threading.Thread):
                             cache_path,
                             record_mode,
                         )
+#                        logger.warning(f"Stored segment {cache_path}")
                 # else retain days includes this segment
                 else:
                     record_mode = self.config.cameras[camera].record.retain.mode
