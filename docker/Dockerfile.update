@@ -1,0 +1,8 @@
+FROM whitepail/frigate-coral
+
+WORKDIR /opt/frigate/
+ADD frigate frigate/
+
+WORKDIR /usr/local/nginx/conf/
+ADD nginx.conf nginx.conf
+

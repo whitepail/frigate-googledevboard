@@ -1,2 +1,2 @@
-#!/usr/bin/execlineb -P
-/usr/local/nginx/sbin/nginx
+#!/bin/bash
+LD_LIBRARY_PATH=/usr/local/nginx/lib /usr/local/nginx/sbin/nginx

@@ -1,0 +1,427 @@
+diff --git a/frigate/__main__.py b/frigate/__main__.py
+index 0d9a3dbe2..d8dd2fb31 100644
+--- a/frigate/__main__.py
++++ b/frigate/__main__.py
+@@ -7,11 +7,16 @@
+ threading.current_thread().name = "frigate"
+ 
+ from frigate.app import FrigateApp
++from frigate.server import ServerApp
+ 
+ cli = sys.modules["flask.cli"]
+ cli.show_server_banner = lambda *x: None
+ 
+ if __name__ == "__main__":
+-    frigate_app = FrigateApp()
++    if "server" in sys.argv:
++        frigate_app = ServerApp()
++    else:
++        frigate_app = FrigateApp()
+ 
+     frigate_app.start()
++
+diff --git a/frigate/app.py b/frigate/app.py
+index bf593d6ac..9ce9b13ad 100644
+--- a/frigate/app.py
++++ b/frigate/app.py
+@@ -17,7 +17,7 @@
+ 
+ from frigate.config import DetectorTypeEnum, FrigateConfig
+ from frigate.const import CACHE_DIR, CLIPS_DIR, RECORD_DIR
+-from frigate.edgetpu import EdgeTPUProcess
++from frigate.edgetpu import EdgeTPUProcess, EdgeTPUConnection
+ from frigate.events import EventCleanup, EventProcessor
+ from frigate.http import create_app
+ from frigate.log import log_process, root_configurer
+@@ -203,6 +203,16 @@ def start_detectors(self):
+                     detector.device,
+                     detector.num_threads,
+                 )
++            if detector.type == DetectorTypeEnum.ip:
++                self.detectors[name] = EdgeTPUConnection(
++                    name,
++                    self.detection_queue,
++                    self.detection_out_events,
++                    model_path,
++                    model_shape,
++                    detector.device,
++                    detector.num_threads,
++                )
+ 
+     def start_detected_frames_processor(self):
+         self.detected_frames_processor = TrackedObjectProcessor(
+diff --git a/frigate/config.py b/frigate/config.py
+index e89b43003..49ec5b7ba 100644
+--- a/frigate/config.py
++++ b/frigate/config.py
+@@ -36,6 +36,7 @@ class Config:
+ class DetectorTypeEnum(str, Enum):
+     edgetpu = "edgetpu"
+     cpu = "cpu"
++    ip = "ip"
+ 
+ 
+ class DetectorConfig(FrigateBaseModel):
+@@ -43,6 +44,9 @@ class DetectorConfig(FrigateBaseModel):
+     device: str = Field(default="usb", title="Device Type")
+     num_threads: int = Field(default=3, title="Number of detection threads")
+ 
++class ServeConfig(FrigateBaseModel):
++    detector : DetectorConfig = Field(default=None, title="Detector")
++    port: int = Field(default=5001, title="Port to listen on")
+ 
+ class MqttConfig(FrigateBaseModel):
+     host: str = Field(title="MQTT Host")
+@@ -701,7 +705,6 @@ class LoggerConfig(FrigateBaseModel):
+         default_factory=dict, title="Log level for specified processes."
+     )
+ 
+-
+ class FrigateConfig(FrigateBaseModel):
+     mqtt: MqttConfig = Field(title="MQTT Configuration.")
+     database: DatabaseConfig = Field(
+@@ -717,6 +720,10 @@ class FrigateConfig(FrigateBaseModel):
+         default={name: DetectorConfig(**d) for name, d in DEFAULT_DETECTORS.items()},
+         title="Detector hardware configuration.",
+     )
++    serve: ServeConfig = Field(
++        default_factory=ServeConfig,
++        title="Detector hardware configuration.",
++    )
+     logger: LoggerConfig = Field(
+         default_factory=LoggerConfig, title="Logging configuration."
+     )
+@@ -902,3 +909,12 @@ def parse_file(cls, config_file):
+             config = json.loads(raw_config)
+ 
+         return cls.parse_obj(config)
++
++class ServerConfig(FrigateConfig):
++    mqtt: BaseModel = Field(default_factory=BaseModel, title="MQTT Configuration.")
++    cameras: Dict[str, CameraConfig] = Field(default_factory=dict, title="Camera configuration.")
++    serve: ServeConfig = Field(title="Detector hardware configuration.")
++
++    @property
++    def runtime_config(self) -> ServerConfig:
++        return self.copy(deep=True)
+diff --git a/frigate/edgetpu.py b/frigate/edgetpu.py
+index 9849f8afc..63ca36979 100644
+--- a/frigate/edgetpu.py
++++ b/frigate/edgetpu.py
+@@ -4,6 +4,7 @@
+ import os
+ import queue
+ import signal
++import socket
+ import threading
+ from abc import ABC, abstractmethod
+ from typing import Dict
+@@ -14,6 +15,7 @@
+ from tflite_runtime.interpreter import load_delegate
+ 
+ from frigate.util import EventsPerSecond, SharedMemoryFrameManager, listen, load_labels
++from frigate.network import NPSocketClient, NPSocket
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -176,6 +178,7 @@ def __init__(
+         model_shape,
+         tf_device=None,
+         num_threads=3,
++        entrypoint=run_detector
+     ):
+         self.name = name
+         self.out_events = out_events
+@@ -187,6 +190,7 @@ def __init__(
+         self.model_shape = model_shape
+         self.tf_device = tf_device
+         self.num_threads = num_threads
++        self.entrypoint = entrypoint
+         self.start_or_restart()
+ 
+     def stop(self):
+@@ -203,7 +207,7 @@ def start_or_restart(self):
+         if (not self.detect_process is None) and self.detect_process.is_alive():
+             self.stop()
+         self.detect_process = mp.Process(
+-            target=run_detector,
++            target=self.entrypoint,
+             name=f"detector:{self.name}",
+             args=(
+                 self.name,
+@@ -220,6 +224,82 @@ def start_or_restart(self):
+         self.detect_process.daemon = True
+         self.detect_process.start()
+ 
++def run_remote(
++    name: str,
++    detection_queue: mp.Queue,
++    out_events: Dict[str, mp.Event],
++    avg_speed,
++    start,
++    model_path,
++    model_shape,
++    tf_device,
++    num_threads,
++):
++    threading.current_thread().name = f"detector:{name}"
++    logger = logging.getLogger(f"detector.{name}")
++    logger.info(f"Starting detection process: {os.getpid()}")
++    setproctitle(f"frigate.detector.{name}")
++    listen()
++
++    stop_event = mp.Event()
++
++    def receiveSignal(signalNumber, frame):
++        stop_event.set()
++
++    signal.signal(signal.SIGTERM, receiveSignal)
++    signal.signal(signal.SIGINT, receiveSignal)
++
++    frame_manager = SharedMemoryFrameManager()
++
++    outputs = {}
++    for name in out_events.keys():
++        out_shm = mp.shared_memory.SharedMemory(name=f"out-{name}", create=False)
++        out_np = np.ndarray((20, 6), dtype=np.float32, buffer=out_shm.buf)
++        outputs[name] = {"shm": out_shm, "np": out_np}
++
++    while not stop_event.is_set():
++        #try:
++        #    while not stop_event.is_set():
++        con = NPSocketClient(tf_device.split(':'))
++
++        while not stop_event.is_set():
++            try:
++                connection_id = detection_queue.get(timeout=5)
++            except queue.Empty:
++                continue
++
++            input_frame = frame_manager.get(
++                connection_id, (1, model_shape[0], model_shape[1], 3)
++            )
++
++            if input_frame is None:
++                continue
++
++            # detect and send the output
++            start.value = datetime.datetime.now().timestamp()
++
++            con.send(a=input_frame)
++            detections = con.recv()
++
++            duration = datetime.datetime.now().timestamp() - start.value
++            outputs[connection_id]["np"][:] = detections[:]
++            out_events[connection_id].set()
++            start.value = 0.0
++
++            avg_speed.value = (avg_speed.value * 9 + duration) / 10
++
++class EdgeTPUConnection(EdgeTPUProcess):
++    def __init__(
++        self,
++        name,
++        detection_queue,
++        out_events,
++        model_path,
++        model_shape,
++        tf_device=None,
++        num_threads=3,
++    ):
++        super().__init__(name, detection_queue, out_events, model_path, model_shape, tf_device, num_threads, run_remote)
+ 
+ class RemoteObjectDetector:
+     def __init__(self, name, labels, detection_queue, event, model_shape):
+diff --git a/frigate/network.py b/frigate/network.py
+new file mode 100644
+index 000000000..557d97439
+--- /dev/null
++++ b/frigate/network.py
+@@ -0,0 +1,81 @@
++from io import BytesIO
++import logging
++import socket
++from struct import pack, unpack
++from typing import Callable, Tuple
++import numpy as np
++import threading
++
++logger = logging.getLogger(__name__)
++
++class Closed(BaseException):
++    pass
++
++class NPSocket(object):
++    def __init__(self, con:socket.socket):
++        self.con = con
++        self.con.setblocking(True)
++
++    def send(self, a:np.ndarray):
++        buf = BytesIO()
++        np.save(buf, a, allow_pickle=False)
++
++        data = buf.getvalue()
++        self.con.sendall(pack("!i", len(data)))
++        self.con.sendall(data)
++
++    def recv(self) -> np.ndarray:
++        buf = self.con.recv(4, socket.MSG_WAITALL)
++        if len(buf)!=4:
++            self.con.close()
++            raise Closed
++
++        length = unpack("!i", buf)[0]
++        data = b''
++        remain = length
++
++        while remain > 0:
++            n = 1024
++            if n>remain:
++                n = remain
++
++            data += self.con.recv(n)
++
++            remain = length - len(data)
++
++        return np.load(BytesIO(data))
++
++class NPSocketClient(NPSocket):
++    def __init__(self, addr:Tuple[str,int]):
++        super().__init__(socket.create_connection(addr))
++        logger.info("New Client")
++
++class NPSocketServer(object):
++    def __init__(self, addr:Tuple[str,int], handler:Callable[["NPSocket"], None]) -> None:
++        self.con = socket.create_server(addr)
++        self.handler = handler
++        logger.info("New Server")
++
++    def listen_and_serve(self):
++        def handler(sock:NPSocket, H:Callable[[NPSocket], None]):
++            try:
++                H(sock)
++            except Closed:
++                pass
++            except BaseException as b:
++                logger.warn("Handler failed")
++                raise
++            logger.info("Closed")
++            sock.con.close()
++
++        while True:
++            client, _ = self.con.accept()
++
++            sock = NPSocket(client)
++            #handler(sock, self.handler)
++
++            t=threading.Thread(target=handler, args=[sock, self.handler], daemon=True)
++            t.start()
++
++if __name__ == "__main__":
++    srv = NPSocketServer(('', 9999), print)
+\ No newline at end of file
+diff --git a/frigate/server.py b/frigate/server.py
+new file mode 100644
+index 000000000..b3cbdde36
+--- /dev/null
++++ b/frigate/server.py
+@@ -0,0 +1,86 @@
++import logging
++from queue import Queue
++import socket
++import sys
++import threading
++import traceback
++import pydantic
++import os
++
++import numpy as np
++
++from frigate.config import DetectorConfig
++from frigate.edgetpu import LocalObjectDetector
++from frigate.app import FrigateApp, VERSION
++from frigate.config import DetectorTypeEnum, ServerConfig
++from frigate.network import NPSocketServer, NPSocket
++
++logger = logging.getLogger(__name__)
++
++class ServerApp(FrigateApp):
++    def init_config(self):
++        config_file = os.environ.get("CONFIG_FILE", "/config/config.yml")
++
++        # Check if we can use .yaml instead of .yml
++        config_file_yaml = config_file.replace(".yml", ".yaml")
++        if os.path.isfile(config_file_yaml):
++            config_file = config_file_yaml
++
++        user_config = ServerConfig.parse_file(config_file)
++        self.config = user_config.runtime_config
++
++    def start(self):
++        logger.info(f"Starting Frigate ({VERSION})")
++        try:
++            try:
++                self.init_config()
++            except Exception as e:
++                print("*************************************************************")
++                print("*************************************************************")
++                print("***    Your config file is not valid!                     ***")
++                print("***    Please check the docs at                           ***")
++                print("***    https://docs.frigate.video/configuration/index     ***")
++                print("*************************************************************")
++                print("*************************************************************")
++                print("***    Config Validation Errors                           ***")
++                print("*************************************************************")
++                print(e.__class__.__name__)
++                print(e)
++                print(traceback.format_exc())
++                print("*************************************************************")
++                print("***    End Config Validation Errors                       ***")
++                print("*************************************************************")
++                sys.exit(1)
++            self.set_log_levels()
++        except Exception as e:
++            print(e)
++            print(traceback.format_exc())
++            sys.exit(1)
++
++        detector : DetectorConfig = self.config.serve.detector
++
++        if detector.type == DetectorTypeEnum.cpu:
++            self.LOD = LocalObjectDetector(tf_device="cpu", model_path=self.config.model.path, num_threads=detector.num_threads)
++        elif detector.type == DetectorTypeEnum.edgetpu:
++            self.LOD = LocalObjectDetector(tf_device=detector.device, model_path=self.config.model.path, num_threads=detector.num_threads)
++        else:
++            raise Exception("Not implemented")
++
++        print(f"Listening on {self.config.serve.port}")
++        srv = NPSocketServer(('', self.config.serve.port), self.handle_conn)
++
++        self.lock = threading.Lock()
++        self.N = 0
++
++        srv.listen_and_serve()
++
++    def handle_conn(self, con:NPSocket):
++        print(f"Connected {con.con.getpeername()}")
++        while True:
++            a = con.recv()
++            with self.lock:
++                self.N += 1
++                if self.N % 100 == 0:
++                    logger.info(f"Handled {self.N} requests")
++                a = self.LOD.detect_raw(a)
++            con.send(a)
+diff --git a/frigate/util.py b/frigate/util.py
+index f11c0b0f9..f663aaea2 100755
+--- a/frigate/util.py
++++ b/frigate/util.py
+@@ -672,7 +672,7 @@ def create(self, name, size) -> AnyStr:
+         self.shm_store[name] = shm
+         return shm.buf
+ 
+-    def get(self, name, shape):
++    def get(self, name, shape) -> np.ndarray:
+         if name in self.shm_store:
+             shm = self.shm_store[name]
+         else:

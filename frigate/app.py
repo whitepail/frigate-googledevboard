@@ -184,23 +184,24 @@ class FrigateApp:
             self.detection_shms.append(shm_out)
 
         for name, detector_config in self.config.detectors.items():
-            self.detectors[name] = DetectionProcess(
-                name,
-                self.detection_queue,
-                self.detection_out_events,
-                model_path,
-                model_shape,
-                detector_config,
-            )
-            if detector.type == DetectorTypeEnum.ip:
+            if detector_config.type == DetectorTypeEnum.ip:
                 self.detectors[name] = EdgeTPUConnection(
                     name,
                     self.detection_queue,
                     self.detection_out_events,
                     model_path,
                     model_shape,
-                    detector.device,
-                    detector.num_threads,
+                    detector_config.device,
+                    detector_config.num_threads,
+                )
+            else:
+                self.detectors[name] = DetectionProcess(
+                    name,
+                    self.detection_queue,
+                    self.detection_out_events,
+                    model_path,
+                    model_shape,
+                    detector_config,
                 )
 
 
