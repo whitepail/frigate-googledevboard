@@ -27,7 +27,7 @@ def object_detector_factory(detector_config: DetectorConfig, model_path: str):
     ):
         return None
     object_detector = LocalObjectDetector(
-        tf_device=detector_config.type,
+        tf_device=detector_config.device,
         model_path=model_path,
         num_threads=detector_config.num_threads,
     )

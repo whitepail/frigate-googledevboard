@@ -98,7 +98,7 @@ class RecordingMaintainer(threading.Thread):
                 creation_time = (
                     os.path.getctime(cache_path)
                 )
-                start_time = datetime.datetime.utcfromtimestamp(creation_time)
+                start_time = datetime.datetime.fromtimestamp(creation_time)
             else:
                 start_time = datetime.datetime.strptime(date, "%Y%m%d%H%M%S")
 
@@ -108,6 +108,7 @@ class RecordingMaintainer(threading.Thread):
                     "start_time": start_time,
                 }
             )
+#            logger.warning(f"Adding to cache {camera} {cache_path} {start_time}")
 
         # delete all cached files past the most recent 5
         keep_count = 5
@@ -150,6 +151,8 @@ class RecordingMaintainer(threading.Thread):
                     not camera in self.config.cameras
                     or not self.config.cameras[camera].record.enabled
                 ):
+
+#                    logger.warning(f"Record not enabled, deleting.")
                     Path(cache_path).unlink(missing_ok=True)
                     self.end_time_cache.pop(cache_path, None)
                     continue
