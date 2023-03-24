@@ -4,6 +4,7 @@ import multiprocessing as mp
 import os
 import queue
 import signal
+import socket
 import threading
 from abc import ABC, abstractmethod
 
@@ -13,6 +14,7 @@ from setproctitle import setproctitle
 from tflite_runtime.interpreter import load_delegate
 
 from frigate.util import EventsPerSecond, SharedMemoryFrameManager, listen, load_labels
+from frigate.network import NPSocketClient, NPSocket
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +177,7 @@ class EdgeTPUProcess:
         model_shape,
         tf_device=None,
         num_threads=3,
+        entrypoint=run_detector
     ):
         self.name = name
         self.out_events = out_events
@@ -186,6 +189,7 @@ class EdgeTPUProcess:
         self.model_shape = model_shape
         self.tf_device = tf_device
         self.num_threads = num_threads
+        self.entrypoint = entrypoint
         self.start_or_restart()
 
     def stop(self):
@@ -202,7 +206,7 @@ class EdgeTPUProcess:
         if (not self.detect_process is None) and self.detect_process.is_alive():
             self.stop()
         self.detect_process = mp.Process(
-            target=run_detector,
+            target=self.entrypoint,
             name=f"detector:{self.name}",
             args=(
                 self.name,
@@ -219,6 +223,82 @@ class EdgeTPUProcess:
         self.detect_process.daemon = True
         self.detect_process.start()
 
+def run_remote(
+    name: str,
+    detection_queue: mp.Queue,
+    out_events: Dict[str, mp.Event],
+    avg_speed,
+    start,
+    model_path,
+    model_shape,
+    tf_device,
+    num_threads,
+):
+    threading.current_thread().name = f"detector:{name}"
+    logger = logging.getLogger(f"detector.{name}")
+    logger.info(f"Starting detection process: {os.getpid()}")
+    setproctitle(f"frigate.detector.{name}")
+    listen()
+
+    stop_event = mp.Event()
+
+    def receiveSignal(signalNumber, frame):
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, receiveSignal)
+    signal.signal(signal.SIGINT, receiveSignal)
+
+    frame_manager = SharedMemoryFrameManager()
+
+    outputs = {}
+    for name in out_events.keys():
+        out_shm = mp.shared_memory.SharedMemory(name=f"out-{name}", create=False)
+        out_np = np.ndarray((20, 6), dtype=np.float32, buffer=out_shm.buf)
+        outputs[name] = {"shm": out_shm, "np": out_np}
+
+    while not stop_event.is_set():
+        #try:
+        #    while not stop_event.is_set():
+        con = NPSocketClient(tf_device.split(':'))
+
+        while not stop_event.is_set():
+            try:
+                connection_id = detection_queue.get(timeout=5)
+            except queue.Empty:
+                continue
+
+            input_frame = frame_manager.get(
+                connection_id, (1, model_shape[0], model_shape[1], 3)
+            )
+
+            if input_frame is None:
+                continue
+
+            # detect and send the output
+            start.value = datetime.datetime.now().timestamp()
+
+            con.send(a=input_frame)
+            detections = con.recv()
+
+            duration = datetime.datetime.now().timestamp() - start.value
+            outputs[connection_id]["np"][:] = detections[:]
+            out_events[connection_id].set()
+            start.value = 0.0
+
+            avg_speed.value = (avg_speed.value * 9 + duration) / 10
+
+class EdgeTPUConnection(EdgeTPUProcess):
+    def __init__(
+        self,
+        name,
+        detection_queue,
+        out_events,
+        model_path,
+        model_shape,
+        tf_device=None,
+        num_threads=3,
+    ):
+        super().__init__(name, detection_queue, out_events, model_path, model_shape, tf_device, num_threads, run_remote)
 
 class RemoteObjectDetector:
     def __init__(self, name, labels, detection_queue, event, model_shape):
